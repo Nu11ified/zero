@@ -348,12 +348,16 @@ assert.equal(symbolContext.ok, true);
 assert.equal(symbolContext.query.kind, "symbol");
 assert.equal(symbolContext.query.name, "main");
 assert.equal(symbolContext.facts.retrieval, "compiler-authored");
+assert.equal(symbolContext.contextIndex.kind, "content-addressed-context-index");
+assert.match(symbolContext.contextIndex.key, /^[0-9a-f]{16}$/);
+assert(symbolContext.contextIndex.invalidation.declaredInputs.includes("sourceMaps.sourceHash"));
+assert(symbolContext.contextIndex.sourceMaps.some((item) => item.path.endsWith("hello.0") && item.sourceHash));
 assert(symbolContext.chain.some((item) => item.role === "entrypoint"));
 assert(symbolContext.chain.some((item) => item.role === "public-contract"));
 assert(symbolContext.contracts.requiresCapabilities.includes("world"));
 assert(symbolContext.editHints[0].mustInspect.includes("main"));
 assert(symbolContext.testsToRun.some((item) => item.includes("zero check --json")));
-assert(symbolContext.sources.some((item) => item.symbol === "main" && /pub fun main/.test(item.snippet)));
+assert(symbolContext.sources.some((item) => item.symbol === "main" && item.sourceHash && /pub fun main/.test(item.snippet)));
 
 const capabilityContext = json(["context", "--json", "--capability", "world", "examples/hello.0"]).body;
 assert.equal(capabilityContext.query.kind, "capability");
