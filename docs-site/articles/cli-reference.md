@@ -94,10 +94,11 @@ zero context --json --capability world examples/hello.0
 zero context --json --diagnostic IFC001 examples/static-interface.0
 ```
 
-Each response includes a content-addressed `contextIndex` with source hashes,
-interface fingerprints, dependency hashes, target, intent, and compiler version.
-The compiler also stores the snapshot under `.zero/context-index/<key>.json`, so
-agents can discard old context whenever any declared input fingerprint changes.
+Each response includes a lightweight content-addressed `contextIndex` with
+source-set, interface, dependency, target, intent, query, and compiler-version
+inputs. The compiler stores only a tiny cache marker under
+`.zero/cache/native/context-<key>.cache`, matching the rest of the native cache
+layout while still giving agents a concrete stale-context invalidation key.
 
 ## Build Outputs
 

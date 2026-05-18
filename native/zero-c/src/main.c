@@ -1973,7 +1973,6 @@ static void append_runtime_shims_json(ZBuf *buf, const char *emitted_symbol_text
 static const Function *find_program_function(const Program *program, const char *name);
 static void append_function_effects_json(ZBuf *buf, const Function *fun);
 static void append_function_ownership_json(ZBuf *buf, const Function *fun);
-static size_t source_line_count(const char *source);
 
 static const char *static_param_kind_json(const Program *program, const char *type) {
   if (type && strcmp(type, "Bool") == 0) return "bool";
@@ -6417,53 +6416,60 @@ static uint64_t context_index_key(const SourceInput *input, const ZTargetInfo *t
   return hash;
 }
 
-static void append_context_source_maps_json(ZBuf *buf, const SourceInput *input) {
-  zbuf_append(buf, "[");
+static uint64_t context_source_set_hash(const SourceInput *input) {
+  uint64_t hash = fnv1a_text("context-source-set");
   for (size_t i = 0; input && i < input->source_file_count; i++) {
-    if (i > 0) zbuf_append(buf, ",");
-    char *source = read_optional_file(input->source_files[i]);
-    const char *text = source ? source : ((input->source_file && strcmp(input->source_files[i], input->source_file) == 0 && input->source) ? input->source : "");
-    zbuf_append(buf, "{\"path\":");
-    append_json_string(buf, input->source_files[i]);
-    zbuf_appendf(buf, ",\"sourceHash\":\"%016llx\",\"lineCount\":%zu,\"columnUnit\":\"utf8-byte\"}",
-                 (unsigned long long)fnv1a_text(text),
-                 source_line_count(text));
-    free(source);
+    hash = mix_hash_text(hash, input->source_files[i]);
+    hash ^= source_file_hash_for_path(input, input->source_files[i]);
+    hash *= 1099511628211ull;
   }
-  zbuf_append(buf, "]");
+  return hash;
 }
 
-static void append_context_index_json(ZBuf *buf, const SourceInput *input, const ZTargetInfo *target, const char *kind, const char *name, const char *intent) {
+static bool context_cache_touch(uint64_t key) {
+  zero_mkdir(".zero");
+  zero_mkdir(".zero/cache");
+  zero_mkdir(".zero/cache/native");
+  char path[256];
+  snprintf(path, sizeof(path), ".zero/cache/native/context-%016llx.cache", (unsigned long long)key);
+  bool hit = path_exists(path);
+  FILE *file = fopen(path, "wb");
+  if (file) {
+    fprintf(file, "context %016llx\n", (unsigned long long)key);
+    fclose(file);
+  }
+  return hit;
+}
+
+static void append_context_index_json(ZBuf *buf, const SourceInput *input, const ZTargetInfo *target, const char *kind, const char *name, const char *intent, bool cache_hit) {
   uint64_t key = context_index_key(input, target, kind, name, intent);
   zbuf_append(buf, "{\"kind\":\"content-addressed-context-index\",\"key\":\"");
   zbuf_appendf(buf, "%016llx", (unsigned long long)key);
-  zbuf_append(buf, "\",\"status\":\"fresh\",\"storageHint\":\".zero/context-index/");
+  zbuf_append(buf, "\",\"hit\":");
+  zbuf_append(buf, cache_hit ? "true" : "false");
+  zbuf_append(buf, ",\"stored\":true,\"storageHint\":\".zero/cache/native/context-");
   zbuf_appendf(buf, "%016llx", (unsigned long long)key);
-  zbuf_append(buf, ".json\",\"compilerVersion\":");
+  zbuf_append(buf, ".cache\",\"compilerVersion\":");
   append_json_string(buf, ZERO_VERSION);
-  zbuf_append(buf, ",\"invalidation\":{\"policy\":\"recompute when any declared input fingerprint changes\",\"declaredInputs\":[\"compilerVersion\",\"query\",\"intent\",\"target\",\"sourceMaps.sourceHash\",\"interfaceFingerprints\",\"dependencyGraphHash\",\"lockfileHash\",\"manifestHash\"]},\"sourceMaps\":");
-  append_context_source_maps_json(buf, input);
-  zbuf_append(buf, ",\"interfaceFingerprints\":");
-  append_interface_fingerprints_json(buf, input, target);
+  zbuf_append(buf, ",\"inputs\":{\"queryKind\":");
+  append_json_string(buf, kind);
+  zbuf_append(buf, ",\"queryName\":");
+  append_json_string(buf, name);
+  zbuf_append(buf, ",\"intent\":");
+  append_json_string(buf, intent ? intent : "edit");
+  zbuf_append(buf, ",\"target\":");
+  append_json_string(buf, target ? target->name : z_host_target());
+  zbuf_appendf(buf, ",\"sourceSetHash\":\"%016llx\",\"interfaceHash\":\"%016llx\",\"dependencyGraphHash\":\"%016llx\",\"manifestHash\":\"%016llx\",\"lockfileHash\":\"%016llx\"}",
+               (unsigned long long)context_source_set_hash(input),
+               (unsigned long long)source_interface_hash(input),
+               (unsigned long long)(input ? input->dependency_graph_hash : 0),
+               (unsigned long long)(input ? input->manifest_hash : 0),
+               (unsigned long long)(input ? input->lockfile_hash : 0));
+  zbuf_append(buf, ",\"invalidatesOn\":[\"source\",\"public symbols/import graph\",\"manifest\",\"dependency graph\",\"target\",\"intent\",\"query\",\"compiler version\"]");
   zbuf_append(buf, "}");
 }
 
-static void write_context_index_snapshot(const SourceInput *input, const ZTargetInfo *target, const Command *command, const char *json) {
-  if (!json) return;
-  const char *kind = command && command->context_diagnostic ? "diagnostic" : (command && command->context_capability ? "capability" : "symbol");
-  const char *name = command && command->context_diagnostic ? command->context_diagnostic : (command && command->context_capability ? command->context_capability : (command && command->context_symbol ? command->context_symbol : "main"));
-  uint64_t key = context_index_key(input, target, kind, name, command ? command->context_for : NULL);
-  zero_mkdir(".zero");
-  zero_mkdir(".zero/context-index");
-  char path[256];
-  snprintf(path, sizeof(path), ".zero/context-index/%016llx.json", (unsigned long long)key);
-  FILE *file = fopen(path, "wb");
-  if (!file) return;
-  fputs(json, file);
-  fclose(file);
-}
-
-static void append_context_json(ZBuf *buf, const SourceInput *input, const Program *program, const ZTargetInfo *target, const Command *command) {
+static void append_context_json(ZBuf *buf, const SourceInput *input, const Program *program, const ZTargetInfo *target, const Command *command, bool cache_hit) {
   const char *kind = command && command->context_diagnostic ? "diagnostic" : (command && command->context_capability ? "capability" : "symbol");
   const char *name = command && command->context_diagnostic ? command->context_diagnostic : (command && command->context_capability ? command->context_capability : (command && command->context_symbol ? command->context_symbol : "main"));
   ZBuf chain;
@@ -6497,7 +6503,7 @@ static void append_context_json(ZBuf *buf, const SourceInput *input, const Progr
   zbuf_append(buf, ",\"compilerVersion\":");
   append_json_string(buf, ZERO_VERSION);
   zbuf_append(buf, ",\"deterministic\":true,\"retrieval\":\"compiler-authored\"},\n  \"contextIndex\": ");
-  append_context_index_json(buf, input, target, kind, name, command ? command->context_for : NULL);
+  append_context_index_json(buf, input, target, kind, name, command ? command->context_for : NULL, cache_hit);
   zbuf_append(buf, ",\n  \"chain\": ");
   zbuf_append(buf, chain.data ? chain.data : "[]");
   zbuf_append(buf, ",\n  \"sources\": ");
@@ -9529,10 +9535,12 @@ int main(int argc, char **argv) {
   }
 
   if (strcmp(command.command, "context") == 0) {
+    const char *kind = command.context_diagnostic ? "diagnostic" : (command.context_capability ? "capability" : "symbol");
+    const char *name = command.context_diagnostic ? command.context_diagnostic : (command.context_capability ? command.context_capability : (command.context_symbol ? command.context_symbol : "main"));
+    bool context_cache_hit = context_cache_touch(context_index_key(&input, target, kind, name, command.context_for));
     ZBuf context;
     zbuf_init(&context);
-    append_context_json(&context, &input, &program, target, &command);
-    write_context_index_snapshot(&input, target, &command, context.data);
+    append_context_json(&context, &input, &program, target, &command, context_cache_hit);
     fputs(context.data, stdout);
     zbuf_free(&context);
     z_free_program(&program);
