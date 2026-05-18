@@ -247,6 +247,7 @@ for (const [command, expected] of [
   [["tokens", "--help"], /Usage: zero tokens/],
   [["parse", "--help"], /Usage: zero parse/],
   [["graph", "--help"], /Usage: zero graph/],
+  [["context", "--help"], /Usage: zero context/],
   [["size", "--help"], /Usage: zero size/],
   [["explain", "--help"], /Usage: zero explain/],
   [["fix", "--help"], /Usage: zero fix/],
@@ -340,6 +341,26 @@ assert.equal(parseTree.choices[0].caseCount, 2);
 assert.equal(parseTree.functions[0].name, "main");
 assert.equal(parseTree.functions[0].paramCount, 1);
 assert.deepEqual(parseTree.functions[0].bodyKinds, ["if", "while", "check", "return"]);
+
+const symbolContext = json(["context", "--json", "--symbol", "main", "--budget", "1200", "examples/hello.0"]).body;
+assert.equal(symbolContext.schemaVersion, 1);
+assert.equal(symbolContext.ok, true);
+assert.equal(symbolContext.query.kind, "symbol");
+assert.equal(symbolContext.query.name, "main");
+assert.equal(symbolContext.facts.retrieval, "compiler-authored");
+assert(symbolContext.chain.some((item) => item.role === "entrypoint"));
+assert(symbolContext.chain.some((item) => item.role === "public-contract"));
+assert(symbolContext.contracts.requiresCapabilities.includes("world"));
+assert(symbolContext.editHints[0].mustInspect.includes("main"));
+assert(symbolContext.testsToRun.some((item) => item.includes("zero check --json")));
+
+const capabilityContext = json(["context", "--json", "--capability", "world", "examples/hello.0"]).body;
+assert.equal(capabilityContext.query.kind, "capability");
+assert(capabilityContext.chain[0].symbols.includes("main"));
+
+const diagnosticContext = json(["context", "--json", "--diagnostic", "IFC001", "examples/static-interface.0"]).body;
+assert.equal(diagnosticContext.query.kind, "diagnostic");
+assert.match(diagnosticContext.chain[0].summary, /generic constraint|concrete type argument/);
 
 const testJson = json(["test", "--json", "--filter", "addition", "conformance/native/pass/test-blocks.0"]).body;
 assert.equal(testJson.schemaVersion, 1);

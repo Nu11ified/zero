@@ -290,6 +290,12 @@ grep -q '"targets":' .zero/native-test/imports-graph.json
 bin/zero graph --json examples/resource-cli > .zero/native-test/resource-cli-graph.json
 grep -q '"importEdges":' .zero/native-test/resource-cli-graph.json
 grep -q '"requiresCapabilities": \["args", "env", "fs", "memory", "path", "world"\]' .zero/native-test/resource-cli-graph.json
+bin/zero context --json --symbol main --budget 1200 examples/resource-cli > .zero/native-test/resource-cli-context.json
+grep -q '"retrieval":"compiler-authored"' .zero/native-test/resource-cli-context.json
+grep -q '"role":"entrypoint"' .zero/native-test/resource-cli-context.json
+grep -q '"editHints"' .zero/native-test/resource-cli-context.json
+bin/zero context --json --capability world examples/resource-cli > .zero/native-test/resource-cli-world-context.json
+grep -q '"role":"required-capability"' .zero/native-test/resource-cli-world-context.json
 bin/zero graph --json conformance/native/pass/std-io-direct.0 > .zero/native-test/std-io-direct-graph.json
 grep -q '"requiresCapabilities": \["memory", "world"\]' .zero/native-test/std-io-direct-graph.json
 grep -q '"name":"std.io.bufferedReader"' .zero/native-test/std-io-direct-graph.json
