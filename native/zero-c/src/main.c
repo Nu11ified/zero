@@ -47,7 +47,6 @@ typedef struct {
   const char *context_capability;
   const char *context_diagnostic;
   const char *context_for;
-  int context_budget;
   int run_argc;
   char **run_argv;
   bool json;
@@ -3085,7 +3084,7 @@ static void print_help(void) {
   printf("  zero run [--target <target>] [--profile debug|dev|release-fast|release-small|tiny|audit] [--release <profile>] [--out <file>] <file.0|project|zero.json> [-- args...]\n");
   printf("  zero ship [--json] [--target <target>] [--profile release-small|tiny|audit] [--out <file>] <file.0|project|zero.json>\n");
   printf("  zero routes [--json] <project|zero.json>\n");
-  printf("  zero context --json [--symbol <name>|--capability <name>|--diagnostic <code>] [--budget <tokens>] <file.0|project|zero.json>\n");
+  printf("  zero context --json [--symbol <name>|--capability <name>|--diagnostic <code>] <file.0|project|zero.json>\n");
   printf("  zero tokens --json <file.0|project|zero.json>\n");
   printf("  zero parse --json <file.0|project|zero.json>\n");
   printf("  zero graph [--json] <file.0|project|zero.json>\n");
@@ -3172,8 +3171,8 @@ static void print_command_help(const char *command) {
     printf("Usage: zero graph [--json] [--target <target>] <file.0|project|zero.json>\n\n");
     printf("Inspect modules, symbols, capabilities, static metadata, and stdlib helpers.\n");
   } else if (strcmp(command, "context") == 0) {
-    printf("Usage: zero context --json [--target <target>] [--symbol <name>|--capability <name>|--diagnostic <code>] [--for edit|debug|explain|test] [--budget <tokens>] <file.0|project|zero.json>\n\n");
-    printf("Emit a token-budgeted compiler context chain for agent edits and explanations.\n");
+    printf("Usage: zero context --json [--target <target>] [--symbol <name>|--capability <name>|--diagnostic <code>] [--for edit|debug|explain|test] <file.0|project|zero.json>\n\n");
+    printf("Emit a compiler-authored context chain with contracts, impact paths, and source snippets for agent edits and explanations.\n");
   } else if (strcmp(command, "doc") == 0) {
     printf("Usage: zero doc [--json] [--target <target>] <file.0|project|zero.json>\n\n");
     printf("Emit package API documentation facts without emitting artifacts.\n");
@@ -3255,10 +3254,6 @@ static bool parse_common_option(int argc, char **argv, int *index, Command *comm
   } else if (strcmp(arg, "--for") == 0) {
     if (*index + 1 >= argc) command->unknown_flag = arg;
     else command->context_for = argv[++(*index)];
-    return true;
-  } else if (strcmp(arg, "--budget") == 0) {
-    if (*index + 1 >= argc) command->unknown_flag = arg;
-    else command->context_budget = atoi(argv[++(*index)]);
     return true;
   } else if (strcmp(arg, "--json") == 0) {
     command->json = true;
@@ -6155,15 +6150,62 @@ static int context_original_line_for_line(const SourceInput *input, int line) {
   return input->source_line_numbers[index] > 0 ? input->source_line_numbers[index] : 1;
 }
 
-static void append_context_name_array_json(ZBuf *buf, const ContextNameList *list, size_t limit) {
+static void append_context_name_array_json(ZBuf *buf, const ContextNameList *list) {
   zbuf_append(buf, "[");
-  size_t written = 0;
-  for (size_t i = 0; list && i < list->len && written < limit; i++) {
-    if (written > 0) zbuf_append(buf, ",");
+  for (size_t i = 0; list && i < list->len; i++) {
+    if (i > 0) zbuf_append(buf, ",");
     append_json_string(buf, list->items[i]);
-    written++;
   }
   zbuf_append(buf, "]");
+}
+
+static char *context_source_snippet(const char *path, int start_line, int end_line) {
+  char *source = read_optional_file(path);
+  if (!source) return z_strdup("");
+  ZBuf snippet;
+  zbuf_init(&snippet);
+  int line = 1;
+  const char *line_start = source;
+  for (const char *cursor = source; ; cursor++) {
+    if (*cursor == '\n' || *cursor == '\0') {
+      if (line >= start_line && line <= end_line) {
+        zbuf_appendf(&snippet, "%d: ", line);
+        char *line_text = z_strndup(line_start, (size_t)(cursor - line_start));
+        zbuf_append(&snippet, line_text);
+        free(line_text);
+        zbuf_append_char(&snippet, '\n');
+      }
+      if (*cursor == '\0' || line >= end_line) break;
+      line++;
+      line_start = cursor + 1;
+    }
+  }
+  free(source);
+  if (!snippet.data) zbuf_append(&snippet, "");
+  return snippet.data;
+}
+
+static int context_function_end_line(const Function *fun) {
+  int end_line = context_stmt_vec_max_line(fun ? &fun->body : NULL);
+  if (fun && end_line < fun->line) end_line = fun->line;
+  return end_line;
+}
+
+static void append_context_function_source_json(ZBuf *buf, const SourceInput *input, const Function *fun) {
+  int end_line = context_function_end_line(fun);
+  int start_original_line = context_original_line_for_line(input, fun ? fun->line : 1);
+  int end_original_line = context_original_line_for_line(input, end_line);
+  if (end_original_line < start_original_line) end_original_line = start_original_line;
+  const char *path = context_path_for_line(input, fun ? fun->line : 1);
+  char *snippet = context_source_snippet(path, start_original_line, end_original_line);
+  zbuf_append(buf, "{\"symbol\":");
+  append_json_string(buf, fun ? fun->name : "");
+  zbuf_append(buf, ",\"file\":");
+  append_json_string(buf, path);
+  zbuf_appendf(buf, ",\"span\":[%d,%d],\"snippet\":", start_original_line, end_original_line);
+  append_json_string(buf, snippet);
+  zbuf_append(buf, "}");
+  free(snippet);
 }
 
 static bool context_capability_enabled(const CapabilitySummary *caps, const char *capability) {
@@ -6197,7 +6239,7 @@ static void append_context_contract_json(ZBuf *buf, const Function *fun) {
   zbuf_append(buf, "}");
 }
 
-static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *input, const Program *program, const ZTargetInfo *target, const Function *root, const char *intent, int budget) {
+static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *input, const Program *program, const ZTargetInfo *target, const Function *root, const char *intent) {
   ContextNameList calls = {0};
   ContextNameList callers = {0};
   ContextNameList impact = {0};
@@ -6209,9 +6251,6 @@ static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *inp
     }
   }
   context_collect_transitive_callers(program, root->name, root->name, &impact, 3);
-  size_t call_limit = budget < 800 ? 2 : (budget < 1800 ? 6 : calls.len);
-  size_t caller_limit = budget < 1200 ? 1 : (budget < 2400 ? 4 : callers.len);
-  size_t impact_limit = budget < 1000 ? 2 : (budget < 2200 ? 6 : impact.len);
   int end_line = context_stmt_vec_max_line(&root->body);
   if (end_line < root->line) end_line = root->line;
   int start_original_line = context_original_line_for_line(input, root->line);
@@ -6230,6 +6269,8 @@ static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *inp
   zbuf_append(chain, ",\"file\":");
   append_json_string(chain, context_path_for_line(input, root->line));
   zbuf_appendf(chain, ",\"span\":[%d,%d]", start_original_line, end_original_line);
+  zbuf_append(chain, ",\"source\":");
+  append_context_function_source_json(chain, input, root);
   zbuf_append(chain, ",\"summary\":");
   ZBuf summary;
   zbuf_init(&summary);
@@ -6240,43 +6281,39 @@ static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *inp
   append_json_string(chain, summary.data);
   zbuf_free(&summary);
   zbuf_append(chain, ",\"links\":");
-  append_context_name_array_json(chain, &calls, call_limit);
+  append_context_name_array_json(chain, &calls);
   zbuf_append(chain, "}");
-  if (budget >= 700) {
-    zbuf_append(chain, ",{\"id\":\"contract:");
-    zbuf_append(chain, root->name);
-    zbuf_append(chain, "\",\"role\":\"public-contract\",\"summary\":\"Return type, raised errors, ownership, and required capabilities are compiler-checked edit boundaries.\",\"contract\":");
-    append_context_contract_json(chain, root);
-    zbuf_append(chain, "}");
-  }
-  if (calls.len > 0 && budget >= 900) {
+  zbuf_append(chain, ",{\"id\":\"contract:");
+  zbuf_append(chain, root->name);
+  zbuf_append(chain, "\",\"role\":\"public-contract\",\"summary\":\"Return type, raised errors, ownership, and required capabilities are compiler-checked edit boundaries.\",\"contract\":");
+  append_context_contract_json(chain, root);
+  zbuf_append(chain, "}");
+  if (calls.len > 0) {
     zbuf_append(chain, ",{\"id\":\"calls:");
     zbuf_append(chain, root->name);
     zbuf_append(chain, "\",\"role\":\"direct-callees\",\"summary\":\"Direct calls from the root body, ordered by source encounter for deterministic inspection.\",\"symbols\":");
-    append_context_name_array_json(chain, &calls, call_limit);
+    append_context_name_array_json(chain, &calls);
     zbuf_append(chain, "}");
   }
   if (callers.len > 0) {
     zbuf_append(chain, ",{\"id\":\"callers:");
     zbuf_append(chain, root->name);
     zbuf_append(chain, "\",\"role\":\"direct-callers\",\"summary\":\"Functions that directly call the root symbol and may need review after contract changes.\",\"symbols\":");
-    append_context_name_array_json(chain, &callers, caller_limit);
+    append_context_name_array_json(chain, &callers);
     zbuf_append(chain, "}");
   }
-  if (impact.len > callers.len && budget >= 1000) {
+  if (impact.len > callers.len) {
     zbuf_append(chain, ",{\"id\":\"impact:");
     zbuf_append(chain, root->name);
     zbuf_append(chain, "\",\"role\":\"impact-path\",\"summary\":\"Bounded transitive caller path from the root symbol toward entrypoints and aggregate factories.\",\"symbols\":");
-    append_context_name_array_json(chain, &impact, impact_limit);
+    append_context_name_array_json(chain, &impact);
     zbuf_append(chain, "}");
   }
-  if (budget >= 1400) {
-    zbuf_append(chain, ",{\"id\":\"target-support:");
-    zbuf_append(chain, root->name);
-    zbuf_append(chain, "\",\"role\":\"target-contract\",\"summary\":\"Required capabilities checked against the selected target.\",\"targetSupport\":");
-    append_target_capability_facts_json(chain, target, &root_caps);
-    zbuf_append(chain, "}");
-  }
+  zbuf_append(chain, ",{\"id\":\"target-support:");
+  zbuf_append(chain, root->name);
+  zbuf_append(chain, "\",\"role\":\"target-contract\",\"summary\":\"Required capabilities checked against the selected target.\",\"targetSupport\":");
+  append_target_capability_facts_json(chain, target, &root_caps);
+  zbuf_append(chain, "}");
   zbuf_append(chain, "]");
   (void)intent;
   context_name_list_free(&calls);
@@ -6284,22 +6321,21 @@ static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *inp
   context_name_list_free(&impact);
 }
 
-static void append_context_capability_chain_json(ZBuf *chain, const Program *program, const char *capability, int budget) {
+static void append_context_capability_chain_json(ZBuf *chain, const Program *program, const char *capability) {
   ContextNameList users = {0};
   for (size_t i = 0; program && i < program->functions.len; i++) {
     CapabilitySummary caps = function_capabilities(&program->functions.items[i]);
     if (context_capability_enabled(&caps, capability)) context_name_list_add(&users, program->functions.items[i].name);
   }
-  size_t user_limit = budget < 1000 ? 6 : users.len;
   zbuf_append(chain, "[{\"id\":\"capability:");
   zbuf_append(chain, capability ? capability : "");
   zbuf_append(chain, "\",\"role\":\"required-capability\",\"summary\":\"Functions in this package that require the selected capability.\",\"symbols\":");
-  append_context_name_array_json(chain, &users, user_limit);
+  append_context_name_array_json(chain, &users);
   zbuf_append(chain, "}]");
   context_name_list_free(&users);
 }
 
-static void append_context_diagnostic_chain_json(ZBuf *chain, const char *code, int budget) {
+static void append_context_diagnostic_chain_json(ZBuf *chain, const char *code) {
   const ExplainInfo *info = find_explain_info(code);
   zbuf_append(chain, "[");
   if (info) {
@@ -6309,17 +6345,55 @@ static void append_context_diagnostic_chain_json(ZBuf *chain, const char *code, 
     append_json_string(chain, info->summary);
     zbuf_append(chain, ",\"repair\":");
     append_json_string(chain, info->canonical_repair);
-    if (budget >= 1000) {
-      zbuf_append(chain, ",\"why\":");
-      append_json_string(chain, info->why);
-    }
+    zbuf_append(chain, ",\"why\":");
+    append_json_string(chain, info->why);
     zbuf_append(chain, "}");
   }
   zbuf_append(chain, "]");
 }
 
+static void context_add_source_symbols(ContextNameList *sources, const Program *program, const ContextNameList *names) {
+  for (size_t i = 0; names && i < names->len; i++) {
+    if (find_program_function(program, names->items[i])) context_name_list_add(sources, names->items[i]);
+  }
+}
+
+static void append_context_sources_json(ZBuf *buf, const SourceInput *input, const Program *program, const Function *root) {
+  ContextNameList calls = {0};
+  ContextNameList callers = {0};
+  ContextNameList impact = {0};
+  ContextNameList sources = {0};
+  if (root) {
+    context_name_list_add(&sources, root->name);
+    context_collect_calls_from_stmt_vec(&root->body, &calls);
+    for (size_t i = 0; program && i < program->functions.len; i++) {
+      const Function *candidate = &program->functions.items[i];
+      if (strcmp(candidate->name, root->name) != 0 && context_function_calls_symbol(candidate, root->name)) {
+        context_name_list_add(&callers, candidate->name);
+      }
+    }
+    context_collect_transitive_callers(program, root->name, root->name, &impact, 3);
+    context_add_source_symbols(&sources, program, &calls);
+    context_add_source_symbols(&sources, program, &callers);
+    context_add_source_symbols(&sources, program, &impact);
+  }
+  zbuf_append(buf, "[");
+  bool wrote = false;
+  for (size_t i = 0; i < sources.len; i++) {
+    const Function *fun = find_program_function(program, sources.items[i]);
+    if (!fun) continue;
+    if (wrote) zbuf_append(buf, ",");
+    append_context_function_source_json(buf, input, fun);
+    wrote = true;
+  }
+  zbuf_append(buf, "]");
+  context_name_list_free(&calls);
+  context_name_list_free(&callers);
+  context_name_list_free(&impact);
+  context_name_list_free(&sources);
+}
+
 static void append_context_json(ZBuf *buf, const SourceInput *input, const Program *program, const ZTargetInfo *target, const Command *command) {
-  int budget = command && command->context_budget > 0 ? command->context_budget : 1200;
   const char *kind = command && command->context_diagnostic ? "diagnostic" : (command && command->context_capability ? "capability" : "symbol");
   const char *name = command && command->context_diagnostic ? command->context_diagnostic : (command && command->context_capability ? command->context_capability : (command && command->context_symbol ? command->context_symbol : "main"));
   ZBuf chain;
@@ -6327,14 +6401,13 @@ static void append_context_json(ZBuf *buf, const SourceInput *input, const Progr
   const Function *root = NULL;
   if (strcmp(kind, "symbol") == 0) {
     root = find_program_function(program, name);
-    if (root) append_context_symbol_chain_json(&chain, input, program, target, root, command ? command->context_for : NULL, budget);
+    if (root) append_context_symbol_chain_json(&chain, input, program, target, root, command ? command->context_for : NULL);
     else zbuf_append(&chain, "[]");
   } else if (strcmp(kind, "capability") == 0) {
-    append_context_capability_chain_json(&chain, program, name, budget);
+    append_context_capability_chain_json(&chain, program, name);
   } else {
-    append_context_diagnostic_chain_json(&chain, name, budget);
+    append_context_diagnostic_chain_json(&chain, name);
   }
-  size_t estimated_tokens = chain.len / 4 + 80;
   zbuf_append(buf, "{\n  \"schemaVersion\": 1,\n  \"ok\": ");
   zbuf_append(buf, root || strcmp(kind, "capability") == 0 || find_explain_info(name) ? "true" : "false");
   zbuf_append(buf, ",\n  \"query\": {\"kind\":");
@@ -6345,9 +6418,7 @@ static void append_context_json(ZBuf *buf, const SourceInput *input, const Progr
     zbuf_append(buf, ",\"for\":");
     append_json_string(buf, command->context_for);
   }
-  zbuf_append(buf, "},\n  \"budget\": {\"requestedTokens\": ");
-  zbuf_appendf(buf, "%d, \"estimatedTokens\": %zu},\n", budget, estimated_tokens);
-  zbuf_append(buf, "  \"root\": ");
+  zbuf_append(buf, "},\n  \"root\": ");
   append_json_string(buf, name);
   zbuf_append(buf, ",\n  \"facts\": {\"sourceFile\":");
   append_json_string(buf, input ? input->source_file : "");
@@ -6355,6 +6426,8 @@ static void append_context_json(ZBuf *buf, const SourceInput *input, const Progr
   append_json_string(buf, target ? target->name : "host");
   zbuf_append(buf, ",\"deterministic\":true,\"retrieval\":\"compiler-authored\"},\n  \"chain\": ");
   zbuf_append(buf, chain.data ? chain.data : "[]");
+  zbuf_append(buf, ",\n  \"sources\": ");
+  append_context_sources_json(buf, input, program, root);
   zbuf_append(buf, ",\n  \"contracts\": ");
   if (root) append_context_contract_json(buf, root);
   else zbuf_append(buf, "{}");

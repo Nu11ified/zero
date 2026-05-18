@@ -21,7 +21,7 @@ Most commands accept the same input forms:
 | `zero build <input>` | Emit an executable, object file, or WebAssembly module. |
 | `zero ship <input>` | Produce a release preview with checksums and metadata. |
 | `zero graph <input>` | Inspect modules, symbols, capabilities, and helper use. |
-| `zero context <input>` | Emit token-budgeted context chains for agent edits. |
+| `zero context <input>` | Emit compiler-authored context chains and source snippets for agent edits. |
 | `zero size <input>` | Explain artifact size, retained helpers, and profile budgets. |
 | `zero doc <input>` | Emit public API documentation facts. |
 | `zero fix --plan --json <input>` | Ask for a typed repair plan. |
@@ -36,7 +36,7 @@ zero test conformance/native/pass/test-blocks.0
 zero build --emit exe --target linux-musl-x64 examples/add.0 --out .zero/out/add
 zero build --emit wasm --target wasm32-wasi examples/direct-wasm-add.0 --out .zero/out/add.wasm
 zero graph --json examples/systems-package
-zero context --json --symbol main --budget 1200 examples/hello.0
+zero context --json --symbol main examples/hello.0
 zero size --json examples/point.0
 zero ship --json --target linux-musl-x64 examples/hello.0 --out .zero/ship/hello
 zero doctor --json
@@ -61,7 +61,7 @@ Use `--json` when another tool will read the result. Text output is for people.
 | --- | --- |
 | `zero check --json` | Diagnostics with code, span, expected/actual details, help, and repair metadata. |
 | `zero graph --json` | Modules, public symbols, capabilities, static facts, and helper use. |
-| `zero context --json` | Token-budgeted `chain`, `contracts`, `editHints`, and `testsToRun` for a symbol, capability, or diagnostic. |
+| `zero context --json` | Compiler-authored `chain`, `sources`, `contracts`, `editHints`, and `testsToRun` for a symbol, capability, or diagnostic. |
 | `zero dev --json` | A watch plan for changed source, manifest, package-lock, and generated-binding inputs. |
 | `zero dev --json --trace` | Adds phase timing, cache hit/miss facts, diagnostics passthrough, and `interfaceFingerprints`. |
 | `zero time --json` | Compiler phase timing plus `interfaceFingerprints` and incremental invalidation facts. |
@@ -85,10 +85,11 @@ linking facts such as retained runtime objects, provider libraries, and
 
 `zero context --json` is a compact agent-facing layer over compiler facts. It
 does not run semantic search or replace `zero graph --json`; it emits a
-deterministic context chain for a selected symbol, capability, or diagnostic:
+deterministic context chain with source snippets for a selected symbol,
+capability, or diagnostic:
 
 ```sh
-zero context --json --symbol main --budget 1200 examples/hello.0
+zero context --json --symbol main examples/hello.0
 zero context --json --capability world examples/hello.0
 zero context --json --diagnostic IFC001 examples/static-interface.0
 ```
@@ -156,7 +157,7 @@ zero ship [--json] [--target <target>] [--profile release-small|tiny|audit] [--o
 zero test [--json] [--filter <name>] [--target <target>] [--cc <path>] [--out <file>] <input>
 zero fmt [--check] <input>
 zero graph [--json] [--target <target>] <input>
-zero context --json [--target <target>] [--symbol <name>|--capability <name>|--diagnostic <code>] [--for edit|debug|explain|test] [--budget <tokens>] <input>
+zero context --json [--target <target>] [--symbol <name>|--capability <name>|--diagnostic <code>] [--for edit|debug|explain|test] <input>
 zero doc [--json] [--target <target>] <input>
 zero size [--json] [--target <target>] [--out <artifact>] <input>
 zero explain [--json] <diagnostic-code>

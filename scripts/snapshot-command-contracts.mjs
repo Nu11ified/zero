@@ -342,7 +342,7 @@ assert.equal(parseTree.functions[0].name, "main");
 assert.equal(parseTree.functions[0].paramCount, 1);
 assert.deepEqual(parseTree.functions[0].bodyKinds, ["if", "while", "check", "return"]);
 
-const symbolContext = json(["context", "--json", "--symbol", "main", "--budget", "1200", "examples/hello.0"]).body;
+const symbolContext = json(["context", "--json", "--symbol", "main", "examples/hello.0"]).body;
 assert.equal(symbolContext.schemaVersion, 1);
 assert.equal(symbolContext.ok, true);
 assert.equal(symbolContext.query.kind, "symbol");
@@ -353,6 +353,7 @@ assert(symbolContext.chain.some((item) => item.role === "public-contract"));
 assert(symbolContext.contracts.requiresCapabilities.includes("world"));
 assert(symbolContext.editHints[0].mustInspect.includes("main"));
 assert(symbolContext.testsToRun.some((item) => item.includes("zero check --json")));
+assert(symbolContext.sources.some((item) => item.symbol === "main" && /pub fun main/.test(item.snippet)));
 
 const capabilityContext = json(["context", "--json", "--capability", "world", "examples/hello.0"]).body;
 assert.equal(capabilityContext.query.kind, "capability");
@@ -384,10 +385,12 @@ writeFileSync(join(contextImpactProject, "src", "main.0"), [
   "}",
   ""
 ].join("\n"));
-const impactContext = json(["context", "--json", "--symbol", "leaf", "--budget", "1600", contextImpactProject]).body;
+const impactContext = json(["context", "--json", "--symbol", "leaf", contextImpactProject]).body;
 const impactPath = impactContext.chain.find((item) => item.role === "impact-path");
 assert(impactPath, "context should include bounded transitive impact path");
 assert.deepEqual(impactPath.symbols, ["middle", "main"]);
+assert(impactContext.sources.some((item) => item.symbol === "leaf" && /return 40/.test(item.snippet)));
+assert(impactContext.sources.some((item) => item.symbol === "main" && /middle\(\)/.test(item.snippet)));
 
 const testJson = json(["test", "--json", "--filter", "addition", "conformance/native/pass/test-blocks.0"]).body;
 assert.equal(testJson.schemaVersion, 1);
