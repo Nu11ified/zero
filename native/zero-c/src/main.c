@@ -43,6 +43,11 @@ typedef struct {
   const char *backend;
   const char *unknown_flag;
   const char *filter;
+  const char *context_symbol;
+  const char *context_capability;
+  const char *context_diagnostic;
+  const char *context_for;
+  int context_budget;
   int run_argc;
   char **run_argv;
   bool json;
@@ -3080,6 +3085,7 @@ static void print_help(void) {
   printf("  zero run [--target <target>] [--profile debug|dev|release-fast|release-small|tiny|audit] [--release <profile>] [--out <file>] <file.0|project|zero.json> [-- args...]\n");
   printf("  zero ship [--json] [--target <target>] [--profile release-small|tiny|audit] [--out <file>] <file.0|project|zero.json>\n");
   printf("  zero routes [--json] <project|zero.json>\n");
+  printf("  zero context --json [--symbol <name>|--capability <name>|--diagnostic <code>] [--budget <tokens>] <file.0|project|zero.json>\n");
   printf("  zero tokens --json <file.0|project|zero.json>\n");
   printf("  zero parse --json <file.0|project|zero.json>\n");
   printf("  zero graph [--json] <file.0|project|zero.json>\n");
@@ -3165,6 +3171,9 @@ static void print_command_help(const char *command) {
   } else if (strcmp(command, "graph") == 0) {
     printf("Usage: zero graph [--json] [--target <target>] <file.0|project|zero.json>\n\n");
     printf("Inspect modules, symbols, capabilities, static metadata, and stdlib helpers.\n");
+  } else if (strcmp(command, "context") == 0) {
+    printf("Usage: zero context --json [--target <target>] [--symbol <name>|--capability <name>|--diagnostic <code>] [--for edit|debug|explain|test] [--budget <tokens>] <file.0|project|zero.json>\n\n");
+    printf("Emit a token-budgeted compiler context chain for agent edits and explanations.\n");
   } else if (strcmp(command, "doc") == 0) {
     printf("Usage: zero doc [--json] [--target <target>] <file.0|project|zero.json>\n\n");
     printf("Emit package API documentation facts without emitting artifacts.\n");
@@ -3230,6 +3239,26 @@ static bool parse_common_option(int argc, char **argv, int *index, Command *comm
   } else if (strcmp(arg, "--filter") == 0) {
     if (*index + 1 >= argc) command->unknown_flag = arg;
     else command->filter = argv[++(*index)];
+    return true;
+  } else if (strcmp(arg, "--symbol") == 0) {
+    if (*index + 1 >= argc) command->unknown_flag = arg;
+    else command->context_symbol = argv[++(*index)];
+    return true;
+  } else if (strcmp(arg, "--capability") == 0) {
+    if (*index + 1 >= argc) command->unknown_flag = arg;
+    else command->context_capability = argv[++(*index)];
+    return true;
+  } else if (strcmp(arg, "--diagnostic") == 0) {
+    if (*index + 1 >= argc) command->unknown_flag = arg;
+    else command->context_diagnostic = argv[++(*index)];
+    return true;
+  } else if (strcmp(arg, "--for") == 0) {
+    if (*index + 1 >= argc) command->unknown_flag = arg;
+    else command->context_for = argv[++(*index)];
+    return true;
+  } else if (strcmp(arg, "--budget") == 0) {
+    if (*index + 1 >= argc) command->unknown_flag = arg;
+    else command->context_budget = atoi(argv[++(*index)]);
     return true;
   } else if (strcmp(arg, "--json") == 0) {
     command->json = true;
@@ -3342,6 +3371,7 @@ static bool parse_command(int argc, char **argv, Command *command) {
          strcmp(command->command, "tokens") == 0 ||
          strcmp(command->command, "parse") == 0 ||
          strcmp(command->command, "graph") == 0 ||
+         strcmp(command->command, "context") == 0 ||
          strcmp(command->command, "doc") == 0 ||
          strcmp(command->command, "size") == 0 ||
          strcmp(command->command, "mem") == 0 ||
@@ -5986,6 +6016,356 @@ static const Function *find_program_function(const Program *program, const char 
     if (strcmp(program->functions.items[i].name, name) == 0) return &program->functions.items[i];
   }
   return NULL;
+}
+
+typedef struct {
+  char **items;
+  size_t len;
+  size_t cap;
+} ContextNameList;
+
+static bool context_name_list_contains(const ContextNameList *list, const char *name) {
+  if (!list || !name) return false;
+  for (size_t i = 0; i < list->len; i++) {
+    if (strcmp(list->items[i], name) == 0) return true;
+  }
+  return false;
+}
+
+static void context_name_list_add(ContextNameList *list, const char *name) {
+  if (!list || !name || !name[0] || context_name_list_contains(list, name)) return;
+  if (list->len + 1 > list->cap) {
+    list->cap = list->cap == 0 ? 8 : list->cap * 2;
+    list->items = realloc(list->items, list->cap * sizeof(char *));
+  }
+  list->items[list->len++] = z_strdup(name);
+}
+
+static void context_name_list_free(ContextNameList *list) {
+  if (!list) return;
+  for (size_t i = 0; i < list->len; i++) free(list->items[i]);
+  free(list->items);
+  memset(list, 0, sizeof(*list));
+}
+
+static void context_collect_calls_from_expr(const Expr *expr, ContextNameList *calls) {
+  if (!expr || !calls) return;
+  if (expr->kind == EXPR_CALL) {
+    char *callee = expr_callee_name(expr->left);
+    context_name_list_add(calls, callee);
+    free(callee);
+  }
+  context_collect_calls_from_expr(expr->left, calls);
+  context_collect_calls_from_expr(expr->right, calls);
+  for (size_t i = 0; i < expr->args.len; i++) context_collect_calls_from_expr(expr->args.items[i], calls);
+  for (size_t i = 0; i < expr->fields.len; i++) context_collect_calls_from_expr(expr->fields.items[i].value, calls);
+}
+
+static void context_collect_calls_from_stmt_vec(const StmtVec *body, ContextNameList *calls) {
+  if (!body || !calls) return;
+  for (size_t i = 0; i < body->len; i++) {
+    const Stmt *stmt = body->items[i];
+    if (!stmt) continue;
+    context_collect_calls_from_expr(stmt->target, calls);
+    context_collect_calls_from_expr(stmt->expr, calls);
+    context_collect_calls_from_expr(stmt->range_end, calls);
+    context_collect_calls_from_stmt_vec(&stmt->then_body, calls);
+    context_collect_calls_from_stmt_vec(&stmt->else_body, calls);
+    for (size_t arm_index = 0; arm_index < stmt->match_arms.len; arm_index++) {
+      context_collect_calls_from_expr(stmt->match_arms.items[arm_index].guard, calls);
+      context_collect_calls_from_stmt_vec(&stmt->match_arms.items[arm_index].body, calls);
+    }
+  }
+}
+
+static bool context_function_calls_symbol(const Function *fun, const char *symbol) {
+  ContextNameList calls = {0};
+  context_collect_calls_from_stmt_vec(fun ? &fun->body : NULL, &calls);
+  bool found = context_name_list_contains(&calls, symbol);
+  context_name_list_free(&calls);
+  return found;
+}
+
+static int context_expr_max_line(const Expr *expr) {
+  if (!expr) return 0;
+  int max_line = expr->line;
+  if (context_expr_max_line(expr->left) > max_line) max_line = context_expr_max_line(expr->left);
+  if (context_expr_max_line(expr->right) > max_line) max_line = context_expr_max_line(expr->right);
+  for (size_t i = 0; i < expr->args.len; i++) {
+    int line = context_expr_max_line(expr->args.items[i]);
+    if (line > max_line) max_line = line;
+  }
+  for (size_t i = 0; i < expr->fields.len; i++) {
+    int line = context_expr_max_line(expr->fields.items[i].value);
+    if (line > max_line) max_line = line;
+  }
+  return max_line;
+}
+
+static int context_stmt_vec_max_line(const StmtVec *body) {
+  int max_line = 0;
+  for (size_t i = 0; body && i < body->len; i++) {
+    const Stmt *stmt = body->items[i];
+    if (!stmt) continue;
+    if (stmt->line > max_line) max_line = stmt->line;
+    int line = context_expr_max_line(stmt->target);
+    if (line > max_line) max_line = line;
+    line = context_expr_max_line(stmt->expr);
+    if (line > max_line) max_line = line;
+    line = context_expr_max_line(stmt->range_end);
+    if (line > max_line) max_line = line;
+    line = context_stmt_vec_max_line(&stmt->then_body);
+    if (line > max_line) max_line = line;
+    line = context_stmt_vec_max_line(&stmt->else_body);
+    if (line > max_line) max_line = line;
+    for (size_t arm_index = 0; arm_index < stmt->match_arms.len; arm_index++) {
+      line = context_expr_max_line(stmt->match_arms.items[arm_index].guard);
+      if (line > max_line) max_line = line;
+      line = context_stmt_vec_max_line(&stmt->match_arms.items[arm_index].body);
+      if (line > max_line) max_line = line;
+    }
+  }
+  return max_line;
+}
+
+static const char *context_path_for_line(const SourceInput *input, int line) {
+  if (!input || line <= 0 || input->source_line_count == 0) return input ? input->source_file : "";
+  size_t index = (size_t)(line - 1);
+  if (index >= input->source_line_count) index = input->source_line_count - 1;
+  return input->source_line_paths[index] ? input->source_line_paths[index] : input->source_file;
+}
+
+static int context_original_line_for_line(const SourceInput *input, int line) {
+  if (!input || line <= 0 || input->source_line_count == 0) return line > 0 ? line : 1;
+  size_t index = (size_t)(line - 1);
+  if (index >= input->source_line_count) index = input->source_line_count - 1;
+  return input->source_line_numbers[index] > 0 ? input->source_line_numbers[index] : 1;
+}
+
+static void append_context_name_array_json(ZBuf *buf, const ContextNameList *list, size_t limit) {
+  zbuf_append(buf, "[");
+  size_t written = 0;
+  for (size_t i = 0; list && i < list->len && written < limit; i++) {
+    if (written > 0) zbuf_append(buf, ",");
+    append_json_string(buf, list->items[i]);
+    written++;
+  }
+  zbuf_append(buf, "]");
+}
+
+static bool context_capability_enabled(const CapabilitySummary *caps, const char *capability) {
+  if (!caps || !capability) return false;
+  if (strcmp(capability, "args") == 0) return caps->args;
+  if (strcmp(capability, "env") == 0) return caps->env;
+  if (strcmp(capability, "fs") == 0) return caps->fs;
+  if (strcmp(capability, "memory") == 0) return caps->memory;
+  if (strcmp(capability, "alloc") == 0) return caps->alloc;
+  if (strcmp(capability, "path") == 0) return caps->path;
+  if (strcmp(capability, "codec") == 0) return caps->codec;
+  if (strcmp(capability, "parse") == 0) return caps->parse;
+  if (strcmp(capability, "time") == 0) return caps->time;
+  if (strcmp(capability, "rand") == 0) return caps->rand;
+  if (strcmp(capability, "net") == 0) return caps->net;
+  if (strcmp(capability, "proc") == 0) return caps->proc;
+  if (strcmp(capability, "web") == 0) return caps->web;
+  if (strcmp(capability, "world") == 0) return caps->world;
+  return false;
+}
+
+static void append_context_contract_json(ZBuf *buf, const Function *fun) {
+  zbuf_append(buf, "{\"kind\":\"function-contract\",\"returnType\":");
+  append_json_string(buf, fun && fun->return_type ? fun->return_type : "Void");
+  zbuf_appendf(buf, ",\"raises\":%s,", fun && fun->raises ? "true" : "false");
+  append_function_error_json(buf, fun);
+  zbuf_append(buf, ",\"requiresCapabilities\":");
+  append_function_effects_json(buf, fun);
+  zbuf_append(buf, ",\"ownership\":");
+  append_function_ownership_json(buf, fun);
+  zbuf_append(buf, "}");
+}
+
+static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *input, const Program *program, const ZTargetInfo *target, const Function *root, const char *intent, int budget) {
+  ContextNameList calls = {0};
+  ContextNameList callers = {0};
+  context_collect_calls_from_stmt_vec(&root->body, &calls);
+  for (size_t i = 0; program && i < program->functions.len; i++) {
+    const Function *candidate = &program->functions.items[i];
+    if (strcmp(candidate->name, root->name) != 0 && context_function_calls_symbol(candidate, root->name)) {
+      context_name_list_add(&callers, candidate->name);
+    }
+  }
+  size_t call_limit = budget < 800 ? 2 : (budget < 1800 ? 6 : calls.len);
+  size_t caller_limit = budget < 1200 ? 1 : (budget < 2400 ? 4 : callers.len);
+  int end_line = context_stmt_vec_max_line(&root->body);
+  if (end_line < root->line) end_line = root->line;
+  int start_original_line = context_original_line_for_line(input, root->line);
+  int end_original_line = context_original_line_for_line(input, end_line);
+  if (end_original_line < start_original_line) end_original_line = start_original_line;
+  zbuf_append(chain, "[");
+  zbuf_append(chain, "{\"id\":");
+  ZBuf id;
+  zbuf_init(&id);
+  zbuf_append(&id, "symbol:");
+  zbuf_append(&id, root->name);
+  append_json_string(chain, id.data);
+  zbuf_free(&id);
+  zbuf_append(chain, ",\"role\":");
+  append_json_string(chain, strcmp(root->name, "main") == 0 ? "entrypoint" : "root-symbol");
+  zbuf_append(chain, ",\"file\":");
+  append_json_string(chain, context_path_for_line(input, root->line));
+  zbuf_appendf(chain, ",\"span\":[%d,%d]", start_original_line, end_original_line);
+  zbuf_append(chain, ",\"summary\":");
+  ZBuf summary;
+  zbuf_init(&summary);
+  zbuf_appendf(&summary, "%s function returning %s", root->is_public ? "Public" : "Private", root->return_type ? root->return_type : "Void");
+  if (root->raises) zbuf_append(&summary, "; propagates fallible calls");
+  CapabilitySummary root_caps = function_capabilities(root);
+  if (root_caps.world || root_caps.fs || root_caps.net || root_caps.proc || root_caps.web) zbuf_append(&summary, "; requires host/runtime capabilities");
+  append_json_string(chain, summary.data);
+  zbuf_free(&summary);
+  zbuf_append(chain, ",\"links\":");
+  append_context_name_array_json(chain, &calls, call_limit);
+  zbuf_append(chain, "}");
+  if (budget >= 700) {
+    zbuf_append(chain, ",{\"id\":\"contract:");
+    zbuf_append(chain, root->name);
+    zbuf_append(chain, "\",\"role\":\"public-contract\",\"summary\":\"Return type, raised errors, ownership, and required capabilities are compiler-checked edit boundaries.\",\"contract\":");
+    append_context_contract_json(chain, root);
+    zbuf_append(chain, "}");
+  }
+  if (calls.len > 0 && budget >= 900) {
+    zbuf_append(chain, ",{\"id\":\"calls:");
+    zbuf_append(chain, root->name);
+    zbuf_append(chain, "\",\"role\":\"direct-callees\",\"summary\":\"Direct calls from the root body, ordered by source encounter for deterministic inspection.\",\"symbols\":");
+    append_context_name_array_json(chain, &calls, call_limit);
+    zbuf_append(chain, "}");
+  }
+  if (callers.len > 0) {
+    zbuf_append(chain, ",{\"id\":\"callers:");
+    zbuf_append(chain, root->name);
+    zbuf_append(chain, "\",\"role\":\"direct-callers\",\"summary\":\"Functions that directly call the root symbol and may need review after contract changes.\",\"symbols\":");
+    append_context_name_array_json(chain, &callers, caller_limit);
+    zbuf_append(chain, "}");
+  }
+  if (budget >= 1400) {
+    zbuf_append(chain, ",{\"id\":\"target-support:");
+    zbuf_append(chain, root->name);
+    zbuf_append(chain, "\",\"role\":\"target-contract\",\"summary\":\"Required capabilities checked against the selected target.\",\"targetSupport\":");
+    append_target_capability_facts_json(chain, target, &root_caps);
+    zbuf_append(chain, "}");
+  }
+  zbuf_append(chain, "]");
+  (void)intent;
+  context_name_list_free(&calls);
+  context_name_list_free(&callers);
+}
+
+static void append_context_capability_chain_json(ZBuf *chain, const Program *program, const char *capability, int budget) {
+  ContextNameList users = {0};
+  for (size_t i = 0; program && i < program->functions.len; i++) {
+    CapabilitySummary caps = function_capabilities(&program->functions.items[i]);
+    if (context_capability_enabled(&caps, capability)) context_name_list_add(&users, program->functions.items[i].name);
+  }
+  size_t user_limit = budget < 1000 ? 6 : users.len;
+  zbuf_append(chain, "[{\"id\":\"capability:");
+  zbuf_append(chain, capability ? capability : "");
+  zbuf_append(chain, "\",\"role\":\"required-capability\",\"summary\":\"Functions in this package that require the selected capability.\",\"symbols\":");
+  append_context_name_array_json(chain, &users, user_limit);
+  zbuf_append(chain, "}]");
+  context_name_list_free(&users);
+}
+
+static void append_context_diagnostic_chain_json(ZBuf *chain, const char *code, int budget) {
+  const ExplainInfo *info = find_explain_info(code);
+  zbuf_append(chain, "[");
+  if (info) {
+    zbuf_append(chain, "{\"id\":\"diagnostic:");
+    zbuf_append(chain, code ? code : "");
+    zbuf_append(chain, "\",\"role\":\"diagnostic-rule\",\"summary\":");
+    append_json_string(chain, info->summary);
+    zbuf_append(chain, ",\"repair\":");
+    append_json_string(chain, info->canonical_repair);
+    if (budget >= 1000) {
+      zbuf_append(chain, ",\"why\":");
+      append_json_string(chain, info->why);
+    }
+    zbuf_append(chain, "}");
+  }
+  zbuf_append(chain, "]");
+}
+
+static void append_context_json(ZBuf *buf, const SourceInput *input, const Program *program, const ZTargetInfo *target, const Command *command) {
+  int budget = command && command->context_budget > 0 ? command->context_budget : 1200;
+  const char *kind = command && command->context_diagnostic ? "diagnostic" : (command && command->context_capability ? "capability" : "symbol");
+  const char *name = command && command->context_diagnostic ? command->context_diagnostic : (command && command->context_capability ? command->context_capability : (command && command->context_symbol ? command->context_symbol : "main"));
+  ZBuf chain;
+  zbuf_init(&chain);
+  const Function *root = NULL;
+  if (strcmp(kind, "symbol") == 0) {
+    root = find_program_function(program, name);
+    if (root) append_context_symbol_chain_json(&chain, input, program, target, root, command ? command->context_for : NULL, budget);
+    else zbuf_append(&chain, "[]");
+  } else if (strcmp(kind, "capability") == 0) {
+    append_context_capability_chain_json(&chain, program, name, budget);
+  } else {
+    append_context_diagnostic_chain_json(&chain, name, budget);
+  }
+  size_t estimated_tokens = chain.len / 4 + 80;
+  zbuf_append(buf, "{\n  \"schemaVersion\": 1,\n  \"ok\": ");
+  zbuf_append(buf, root || strcmp(kind, "capability") == 0 || find_explain_info(name) ? "true" : "false");
+  zbuf_append(buf, ",\n  \"query\": {\"kind\":");
+  append_json_string(buf, kind);
+  zbuf_append(buf, ",\"name\":");
+  append_json_string(buf, name);
+  if (command && command->context_for) {
+    zbuf_append(buf, ",\"for\":");
+    append_json_string(buf, command->context_for);
+  }
+  zbuf_append(buf, "},\n  \"budget\": {\"requestedTokens\": ");
+  zbuf_appendf(buf, "%d, \"estimatedTokens\": %zu},\n", budget, estimated_tokens);
+  zbuf_append(buf, "  \"root\": ");
+  append_json_string(buf, name);
+  zbuf_append(buf, ",\n  \"facts\": {\"sourceFile\":");
+  append_json_string(buf, input ? input->source_file : "");
+  zbuf_append(buf, ",\"target\":");
+  append_json_string(buf, target ? target->name : "host");
+  zbuf_append(buf, ",\"deterministic\":true,\"retrieval\":\"compiler-authored\"},\n  \"chain\": ");
+  zbuf_append(buf, chain.data ? chain.data : "[]");
+  zbuf_append(buf, ",\n  \"contracts\": ");
+  if (root) append_context_contract_json(buf, root);
+  else zbuf_append(buf, "{}");
+  zbuf_append(buf, ",\n  \"editHints\": [");
+  if (root) {
+    zbuf_append(buf, "{\"intent\":");
+    append_json_string(buf, command && command->context_for ? command->context_for : "edit");
+    zbuf_append(buf, ",\"mustInspect\":[");
+    append_json_string(buf, name);
+    zbuf_append(buf, "],\"safeToIgnore\":[\"unrelated package metadata\"]}");
+  } else if (strcmp(kind, "capability") == 0) {
+    zbuf_append(buf, "{\"intent\":\"capability audit\",\"mustInspect\":[");
+    append_json_string(buf, name);
+    zbuf_append(buf, "],\"safeToIgnore\":[\"symbols not listed in the capability chain\"]}");
+  } else if (find_explain_info(name)) {
+    zbuf_append(buf, "{\"intent\":\"diagnostic repair\",\"mustInspect\":[");
+    append_json_string(buf, name);
+    zbuf_append(buf, "],\"safeToIgnore\":[\"unrelated symbols without the diagnostic\"]}");
+  }
+  zbuf_append(buf, "],\n  \"testsToRun\": [");
+  ZBuf check_command;
+  zbuf_init(&check_command);
+  zbuf_append(&check_command, "zero check --json ");
+  zbuf_append(&check_command, input && input->source_file ? input->source_file : ".");
+  append_json_string(buf, check_command.data);
+  zbuf_free(&check_command);
+  zbuf_append(buf, ", ");
+  ZBuf test_command;
+  zbuf_init(&test_command);
+  zbuf_append(&test_command, "zero test ");
+  zbuf_append(&test_command, input && input->source_file ? input->source_file : ".");
+  append_json_string(buf, test_command.data);
+  zbuf_free(&test_command);
+  zbuf_append(buf, "],\n  \"unsafeAssumptions\": []\n}\n");
+  zbuf_free(&chain);
 }
 
 typedef struct TestValue TestValue;
@@ -8846,7 +9226,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (strcmp(command.command, "graph") != 0 && !validate_target_capabilities(&program, target, &diag, input.source_file)) {
+  if (strcmp(command.command, "graph") != 0 && strcmp(command.command, "context") != 0 && !validate_target_capabilities(&program, target, &diag, input.source_file)) {
     if (strcmp(command.command, "fix") == 0) {
       print_fix_plan_json(input.source_file, &diag);
       z_free_program(&program);
@@ -8860,7 +9240,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (strcmp(command.command, "graph") != 0 && !validate_package_dependencies_for_target(&input, target, &diag)) {
+  if (strcmp(command.command, "graph") != 0 && strcmp(command.command, "context") != 0 && !validate_package_dependencies_for_target(&input, target, &diag)) {
     if (command.json) print_diag_json(diag.path ? diag.path : command.input, &diag);
     else print_diag(diag.path ? diag.path : command.input, &diag);
     z_free_program(&program);
@@ -8972,6 +9352,17 @@ int main(int argc, char **argv) {
     append_graph_json(&graph, &input, &program, target);
     fputs(graph.data, stdout);
     zbuf_free(&graph);
+    z_free_program(&program);
+    z_free_source(&input);
+    return 0;
+  }
+
+  if (strcmp(command.command, "context") == 0) {
+    ZBuf context;
+    zbuf_init(&context);
+    append_context_json(&context, &input, &program, target, &command);
+    fputs(context.data, stdout);
+    zbuf_free(&context);
     z_free_program(&program);
     z_free_source(&input);
     return 0;
