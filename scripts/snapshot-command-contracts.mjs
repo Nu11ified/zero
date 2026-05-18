@@ -362,6 +362,33 @@ const diagnosticContext = json(["context", "--json", "--diagnostic", "IFC001", "
 assert.equal(diagnosticContext.query.kind, "diagnostic");
 assert.match(diagnosticContext.chain[0].summary, /generic constraint|concrete type argument/);
 
+const contextImpactProject = join(outDir, "context-impact");
+mkdirSync(join(contextImpactProject, "src"), { recursive: true });
+writeFileSync(join(contextImpactProject, "zero.json"), JSON.stringify({
+  package: { name: "context-impact", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "src/main.0" } }
+}, null, 2));
+writeFileSync(join(contextImpactProject, "src", "main.0"), [
+  "fun leaf() -> i32 {",
+  "    return 40",
+  "}",
+  "",
+  "fun middle() -> i32 {",
+  "    return leaf() + 2",
+  "}",
+  "",
+  "pub fun main(world: World) -> Void raises {",
+  "    if middle() == 42 {",
+  "        check world.out.write(\"context impact ok\\n\")",
+  "    }",
+  "}",
+  ""
+].join("\n"));
+const impactContext = json(["context", "--json", "--symbol", "leaf", "--budget", "1600", contextImpactProject]).body;
+const impactPath = impactContext.chain.find((item) => item.role === "impact-path");
+assert(impactPath, "context should include bounded transitive impact path");
+assert.deepEqual(impactPath.symbols, ["middle", "main"]);
+
 const testJson = json(["test", "--json", "--filter", "addition", "conformance/native/pass/test-blocks.0"]).body;
 assert.equal(testJson.schemaVersion, 1);
 assert.equal(testJson.ok, true);

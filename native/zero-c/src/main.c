@@ -6086,6 +6086,19 @@ static bool context_function_calls_symbol(const Function *fun, const char *symbo
   return found;
 }
 
+static void context_collect_transitive_callers(const Program *program, const char *root_symbol, const char *symbol, ContextNameList *out, size_t depth) {
+  if (!program || !symbol || !out || depth == 0) return;
+  for (size_t i = 0; i < program->functions.len; i++) {
+    const Function *candidate = &program->functions.items[i];
+    if (!candidate->name || strcmp(candidate->name, symbol) == 0) continue;
+    if (root_symbol && strcmp(candidate->name, root_symbol) == 0) continue;
+    if (!context_function_calls_symbol(candidate, symbol)) continue;
+    bool already_seen = context_name_list_contains(out, candidate->name);
+    context_name_list_add(out, candidate->name);
+    if (!already_seen) context_collect_transitive_callers(program, root_symbol, candidate->name, out, depth - 1);
+  }
+}
+
 static int context_expr_max_line(const Expr *expr) {
   if (!expr) return 0;
   int max_line = expr->line;
@@ -6187,6 +6200,7 @@ static void append_context_contract_json(ZBuf *buf, const Function *fun) {
 static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *input, const Program *program, const ZTargetInfo *target, const Function *root, const char *intent, int budget) {
   ContextNameList calls = {0};
   ContextNameList callers = {0};
+  ContextNameList impact = {0};
   context_collect_calls_from_stmt_vec(&root->body, &calls);
   for (size_t i = 0; program && i < program->functions.len; i++) {
     const Function *candidate = &program->functions.items[i];
@@ -6194,8 +6208,10 @@ static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *inp
       context_name_list_add(&callers, candidate->name);
     }
   }
+  context_collect_transitive_callers(program, root->name, root->name, &impact, 3);
   size_t call_limit = budget < 800 ? 2 : (budget < 1800 ? 6 : calls.len);
   size_t caller_limit = budget < 1200 ? 1 : (budget < 2400 ? 4 : callers.len);
+  size_t impact_limit = budget < 1000 ? 2 : (budget < 2200 ? 6 : impact.len);
   int end_line = context_stmt_vec_max_line(&root->body);
   if (end_line < root->line) end_line = root->line;
   int start_original_line = context_original_line_for_line(input, root->line);
@@ -6247,6 +6263,13 @@ static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *inp
     append_context_name_array_json(chain, &callers, caller_limit);
     zbuf_append(chain, "}");
   }
+  if (impact.len > callers.len && budget >= 1000) {
+    zbuf_append(chain, ",{\"id\":\"impact:");
+    zbuf_append(chain, root->name);
+    zbuf_append(chain, "\",\"role\":\"impact-path\",\"summary\":\"Bounded transitive caller path from the root symbol toward entrypoints and aggregate factories.\",\"symbols\":");
+    append_context_name_array_json(chain, &impact, impact_limit);
+    zbuf_append(chain, "}");
+  }
   if (budget >= 1400) {
     zbuf_append(chain, ",{\"id\":\"target-support:");
     zbuf_append(chain, root->name);
@@ -6258,6 +6281,7 @@ static void append_context_symbol_chain_json(ZBuf *chain, const SourceInput *inp
   (void)intent;
   context_name_list_free(&calls);
   context_name_list_free(&callers);
+  context_name_list_free(&impact);
 }
 
 static void append_context_capability_chain_json(ZBuf *chain, const Program *program, const char *capability, int budget) {
